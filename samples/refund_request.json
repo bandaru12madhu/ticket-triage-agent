@@ -1,0 +1,6 @@
+{
+  "subject": "Order arrived damaged",
+  "body": "The blender I ordered last week arrived with a cracked jar. I took photos. I would like my money back please.",
+  "customer_email": "sam@example.com",
+  "order_total": 64.50
+}
