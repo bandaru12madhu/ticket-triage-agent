@@ -8,6 +8,7 @@ from langgraph.types import Command
 
 from app.knowledge import KnowledgeBase
 from app.llm import get_llm
+from app.memory import CustomerMemory
 from app.models import ReviewIn, TicketIn
 from app.outbox import Outbox
 from app.store import TicketStore
@@ -31,11 +32,12 @@ def describe(graph, ticket_id):
         "summary": classification.get("summary"),
         "proposed_action": values.get("action"),
         "draft_reply": values.get("reply"),
+        "customer_history": values.get("history", []),
         "outcome": values.get("outcome"),
     }
 
 
-def build_default_graph(data_dir):
+def build_default_graph(data_dir, memory):
     from langgraph.checkpoint.sqlite import SqliteSaver
 
     from app.graph import build_graph
@@ -46,25 +48,35 @@ def build_default_graph(data_dir):
         KnowledgeBase(os.getenv("KB_DIR", "kb")),
         Outbox(str(Path(data_dir) / "outbox.jsonl")),
         SqliteSaver(conn),
+        memory,
     )
 
 
-def create_app(graph=None, store=None, data_dir=None):
+def create_app(graph=None, store=None, memory=None, data_dir=None):
     data_dir = data_dir or os.getenv("DATA_DIR", "data")
 
-    app = FastAPI(title="Support Ticket Triage", version="1.0.0")
-    holder = {"graph": graph, "store": store}
+    app = FastAPI(title="Support Ticket Triage", version="1.1.0")
+    holder = {"graph": graph, "store": store, "memory": memory}
+
+    def make_data_dir():
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+
+    def get_memory():
+        if holder["memory"] is None:
+            make_data_dir()
+            holder["memory"] = CustomerMemory(str(Path(data_dir) / "memory.db"))
+        return holder["memory"]
 
     def get_graph():
         # built on first use so importing the module does not need an API key
         if holder["graph"] is None:
-            Path(data_dir).mkdir(parents=True, exist_ok=True)
-            holder["graph"] = build_default_graph(data_dir)
+            make_data_dir()
+            holder["graph"] = build_default_graph(data_dir, get_memory())
         return holder["graph"]
 
     def get_store():
         if holder["store"] is None:
-            Path(data_dir).mkdir(parents=True, exist_ok=True)
+            make_data_dir()
             holder["store"] = TicketStore(str(Path(data_dir) / "tickets.db"))
         return holder["store"]
 
@@ -112,6 +124,14 @@ def create_app(graph=None, store=None, data_dir=None):
         config = {"configurable": {"thread_id": ticket_id}}
         get_graph().invoke(Command(resume=review.model_dump()), config)
         return describe(get_graph(), ticket_id)
+
+    @app.get("/customers/history")
+    def customer_history(email: str):
+        return get_memory().recent(email, 20)
+
+    @app.delete("/customers/history")
+    def forget_customer(email: str):
+        return {"deleted": get_memory().forget(email)}
 
     return app
 

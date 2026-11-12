@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 from app.graph import build_graph
 from app.knowledge import KnowledgeBase
 from app.main import create_app
+from app.memory import CustomerMemory
 from app.outbox import Outbox
 from app.store import TicketStore
 from tests.fakes import KB_DIR, ScriptedModel, action, classification
@@ -17,9 +18,11 @@ TICKET = {
 def make_client(tmp_path, actions, replies):
     model = ScriptedModel([classification() for _ in actions], actions, replies)
     outbox = Outbox(str(tmp_path / "outbox.jsonl"))
-    graph = build_graph(model, KnowledgeBase(KB_DIR), outbox)
+    memory = CustomerMemory(str(tmp_path / "memory.db"))
+    graph = build_graph(model, KnowledgeBase(KB_DIR), outbox, memory=memory)
     store = TicketStore(str(tmp_path / "tickets.db"))
-    return TestClient(create_app(graph=graph, store=store, data_dir=str(tmp_path))), outbox
+    app = create_app(graph=graph, store=store, memory=memory, data_dir=str(tmp_path))
+    return TestClient(app), outbox
 
 
 def test_health(tmp_path):
@@ -85,3 +88,39 @@ def test_bad_ticket_is_rejected(tmp_path):
     client, _ = make_client(tmp_path, [], [])
     assert client.post("/tickets", json={"subject": "", "body": "text"}).status_code == 422
     assert client.post("/tickets", json={"subject": "hi", "body": "text", "order_total": -5}).status_code == 422
+
+
+def test_second_ticket_shows_the_customer_history(tmp_path):
+    client, _ = make_client(
+        tmp_path,
+        [action("none"), action("refund", 10.0, "damaged")],
+        ["Reply one", "Reply two"],
+    )
+    ticket = {**TICKET, "customer_email": "sam@example.com"}
+
+    first = client.post("/tickets", json=ticket).json()
+    assert first["customer_history"] == []
+
+    second = client.post("/tickets", json=ticket).json()
+    assert second["status"] == "waiting_for_approval"
+    assert len(second["customer_history"]) == 1
+    assert second["customer_history"][0]["status"] == "auto_replied"
+
+
+def test_history_endpoint_and_forget(tmp_path):
+    client, _ = make_client(tmp_path, [action("none"), action("none")], ["One", "Two"])
+    ticket = {**TICKET, "customer_email": "Sam@Example.com"}
+    client.post("/tickets", json=ticket)
+    client.post("/tickets", json=ticket)
+
+    history = client.get("/customers/history", params={"email": "sam@example.com"}).json()
+    assert len(history) == 2
+
+    deleted = client.delete("/customers/history", params={"email": "sam@example.com"}).json()
+    assert deleted == {"deleted": 2}
+    assert client.get("/customers/history", params={"email": "sam@example.com"}).json() == []
+
+
+def test_history_endpoint_needs_an_email(tmp_path):
+    client, _ = make_client(tmp_path, [], [])
+    assert client.get("/customers/history").status_code == 422
